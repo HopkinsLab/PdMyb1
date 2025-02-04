@@ -1,10 +1,8 @@
-# README
-
-## phenotype_code
+# phenotype_code
 
 All scripts were run using R/4.2.2
 
-### Setup
+## Setup
 
 Install R packages, as needed
 
@@ -18,7 +16,7 @@ Make results directory
 mkdir results/
 ```
 
-### Run scripts
+## Run scripts
 
 VIGS analyses
 
