@@ -28,7 +28,6 @@ done
 # minimap2 might yield slightly more homozygous REF sites (0/0); the two versions disagree 
 # on snp calls ~5% of the time based on spot-checking sample 01_01_06.
 
-# sbatch ./index_ref.sh
 sbatch -a 1-112 ./align.sh
 
 
@@ -41,6 +40,7 @@ sbatch ./merge_vcfs.sh cusp # Merge cuspidata vcfs
 # Determine depth in region using DP field
 sbatch -c 1 --mem-per-cpu=4G ./render_rmd.sh assess_depth.Rmd
 # See assess_depth.html for rendered notebook
+# Outputs figureS6.pdf as well
 
 
 # Filter vcfs and narrow down to high depth window.
@@ -57,7 +57,6 @@ sbatch ./phase_snps.sh
 
 ## Pairwise LD
 sbatch ./pairwise_ld.sh
-# ./render_rmd.sh pairwise_ld.Rmd
 
 ## GWAS
 sbatch gwas.sh 0.025 Qual_Int
@@ -66,14 +65,16 @@ sbatch gwas.sh 0.025 Quant_Int_Bright
 sbatch -c 1 --mem-per-cpu=4G ./render_rmd.sh gwas_plot.Rmd
 
 ## Pi, dxy, and Fst (computed using pixy)
-# sbatch pixy.sh Int
 sbatch pixy.sh region
+
+## Figure 3: 
+## GWAS
+sbatch -c 1 --mem-per-cpu=8G ./render_rmd.sh figure3.Rmd
 
 ## Figure 4: 
 ## Selection scans, haplotype homozygosity (EHH, XP-EHH), 
 ## Fst, pi
 sbatch -c 1 --mem-per-cpu=16G ./render_rmd.sh figure4.Rmd
-#./render_rmd.sh selection.Rmd
 
 
 
