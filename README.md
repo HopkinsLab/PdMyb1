@@ -8,6 +8,8 @@ This repo contains the population genetic analyses from Garner et al. 2024 __DOI
 
 VIGS, expression data, and phenotyping figures can be found in `phenotype_code/`
 
+ONT sequence processing can be found in `seqproc_code`
+
 SNP calling, association data, and population genetic analyses can be found in `popgen_code/` 
 
 ## Dependencies
@@ -21,6 +23,7 @@ Install conda environments:
 ```bash
 conda env create -f envs/myb.yaml
 conda env create -f envs/pixy.yaml
+conda env create -f envs/sacra_tools.yaml
 ```
 
 Install plink and edit corresponding variable in `popgen_code/utils/init_env.sh`
