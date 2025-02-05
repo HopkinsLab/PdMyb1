@@ -1,0 +1,155 @@
+---
+title: "GWAS Plotting"
+output: html_document
+---
+
+
+## Load packages
+```{r loadPkg, message=FALSE}
+# Install packages
+req_pkgs <- c("data.table", "stringr", "ggpubr")
+for(pkg in req_pkgs){
+    if(!require(pkg, character.only=TRUE)){install.packages(pkg, repos="https://cloud.r-project.org/"); library(pkg, character.only=TRUE)}
+}
+```
+
+## Load data
+```{r loadRes}
+gwas_prefix <- "results/gwas/merged.drum.filt.lmiss_0.5.imiss_0.9.polarized.bi"
+pheno_nms <- c("Qual_Int", "Quant_Chroma", "Quant_Int_Bright")
+dat <- list()
+for(pheno in pheno_nms){
+    # Note that Brightness is essentially the quantitative trait
+    # for Intensity hence the name "Quant_Int_Bright"
+    fn <- str_interp("${gwas_prefix}.${pheno}.gemma.relmat.maf_0.025.ulmm.assoc.txt")
+    dat[[pheno]] <- fread(fn, header=TRUE)
+    dat[[pheno]][, PHENO := pheno]
+}
+dat <- rbindlist(dat)
+dat[, COORD := as.numeric(ps) / 1e3]
+```
+
+## Identify outliers
+
+First, let's calculate the bonferroni threshold (alpha = 0.05)
+
+```{r bonferroni}
+a <- 0.05
+bonf_thresh <- a / nrow(dat[PHENO == "Qual_Int"])
+cat(str_interp("a = $[0.02f]{a}\n"))
+cat(str_interp("-log10( a_corrected ) = $[0.1f]{-log10(bonf_thresh)} \n"))
+```
+
+Now, report all SNPs below threshold
+```{r}
+print(dat[p_wald < bonf_thresh, ])
+```
+
+For all phenotypes, we have two snps below the threshold:
+- SNP1: 22302338
+- SNP2: 22302416
+```{r defineOutliers}
+outlier_snps <- dat[PHENO == "Qual_Int"][p_wald < bonf_thresh, ps[order(p_wald)]]
+cat(str_interp("$[d]{outlier_snps[1]}\n"), file="annot/PdMyb1.putative_snp.pos")
+```
+
+## Report log p values 
+```{r reportPvals}
+for(i in seq_along(outlier_snps)){
+    snp <- outlier_snps[i]
+    cat(str_interp("SNP${i}, pos = $[d]{snp}:\n"))
+    print(dat[ps == snp, .(PHENO, LOG10P=-log10(p_wald))])
+    cat("\n")
+}
+```
+## PVE: Regress phenotypes against outlier SNPs
+
+First we need genotypes at the SNPs
+```{r loadGTs}
+snp_gts <- list()
+for(pheno in pheno_nms){ 
+    tmp <- fread(str_interp("${gwas_prefix}.${pheno}.recode.traw"), header=TRUE, sep="\t", na.strings="NA")[POS %in% outlier_snps]
+
+    snp_gts[[pheno]] <- fread(str_interp("${gwas_prefix}.${pheno}.fam"), header=FALSE, col.names=c("FID", "IID", "PAT_ID", "MAT_ID", "SEX", "VAL"))
+    snp_gts[[pheno]][, PHENO := pheno]
+    fid_iid <- snp_gts[[pheno]][, str_c(FID, "_", IID)]
+    
+    for(i in seq_along(outlier_snps)){
+        new_col <- str_c("SNP", i)
+        new_val <- unlist(tmp[POS == outlier_snps[i], fid_iid, with=FALSE])
+        snp_gts[[pheno]][, eval(new_col) := new_val]
+    }
+}
+
+snp_gts <- rbindlist(snp_gts)
+```
+
+Now let's regress to get percent variance explained by each snp (PVE)
+
+```{r regression}
+calcPVE <- function(in_dat, xvar="SNP1", yvar="VAL"){
+    fmla <- as.formula(str_interp("${yvar} ~ ${xvar}"))
+    m <- lm(fmla, in_dat)
+    return(summary(m)$r.squared)
+}
+
+```
+
+
+## Load LD data at SNP1
+
+Let's load the R^2 results for SNP1 pairwise to all other snps.
+
+```{r loadLD}
+ld_prefix <- "results/pairwise_ld/merged.drum.filt.lmiss_0.5.imiss_0.9.polarized.bi"
+ld_pos <- fread(str_interp("${ld_prefix}.bim"), header=FALSE)$V4
+keep_col <- which(ld_pos == outlier_snps[1])
+
+ld_vals <- fread(str_interp("${ld_prefix}_ld.ld"), header=FALSE, select=keep_col)
+names(ld_vals) <- "RSQ"
+ld_vals[, ps := ld_pos]
+```
+
+What's R^2 between SNP1 and SNP2?
+
+```{r reportLD}
+x <- ld_vals[ps == outlier_snps[2], RSQ]
+cat(str_interp("R^2 between SNP1 and SNP2: $[0.2f]{x}\n"))
+```
+
+## Plot results
+
+Need a function for transforming the -log10 transformation on the y-axis.
+
+```{r plotFuncs}
+neg_log10_trans <- function() {
+    scales::trans_new(
+        name = "neg_log10",
+        transform = function(x) -log10(x),
+        inverse = function(x) 10^(-x)
+    )
+}
+```
+
+
+Manhattan plot
+
+```{r plotManhat, fig.width=12, fig.height=4}
+# Add R2 information
+dat <- merge(dat, ld_vals, by="ps", all.x=TRUE, all.y=FALSE)
+
+for(pheno in pheno_nms){
+    pwrs <- seq(-2, -18, by=-4)
+    brks <- 10 ^ pwrs
+    labs <- sprintf("%d", -pwrs)
+
+    p <- ggscatter(dat[PHENO == pheno], x="COORD", y="p_wald", alpha=0.5, color="RSQ") + 
+        scale_y_continuous(trans=neg_log10_trans(), breaks=brks, labels=labs) +
+        ylab(bquote(- log[10](p))) +
+        scale_x_reverse() +
+        xlab("chr6 position (kb)") +
+        ggtitle(pheno)
+    print(p)
+}
+# ggsave(p, file="tmp.pdf", width=12, height=4)
+```

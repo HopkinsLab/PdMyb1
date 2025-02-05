@@ -1,0 +1,457 @@
+---
+title: "GWAS Plotting"
+output: html_document
+---
+
+
+## Load packages
+```{r loadPkg, message=FALSE}
+# Install packages
+req_pkgs <- c("data.table", "stringr", "ggpubr", "ggbeeswarm", "patchwork")
+for(pkg in req_pkgs){
+    if(!require(pkg, character.only=TRUE)){install.packages(pkg, repos="https://cloud.r-project.org/"); library(pkg, character.only=TRUE)}
+}
+```
+
+## Load data
+
+Load association results
+
+```{r loadRes}
+gwas_prefix <- "results/gwas/merged.drum.filt.lmiss_0.5.imiss_0.9.polarized.bi"
+pheno_nms <- c("Qual_Int", "Quant_Chroma", "Quant_Int_Bright")
+dat <- list()
+for(pheno in pheno_nms){
+    # Note that Brightness is essentially the quantitative trait
+    # for Intensity hence the name "Quant_Int_Bright"
+    fn <- str_interp("${gwas_prefix}.${pheno}.gemma.relmat.maf_0.025.ulmm.assoc.txt")
+    dat[[pheno]] <- fread(fn, header=TRUE)
+    dat[[pheno]][, PHENO := pheno]
+}
+dat <- rbindlist(dat)
+dat[, COORD := as.numeric(ps) / 1e3]
+```
+
+Load bed window
+```{r loadAnnot}
+bed_fn <- "results/bcf_pipe/call/drum.hi_dep_region.bed"
+bed_d <- fread(bed_fn, header=FALSE, col.names=c("CHROM", "START", "END"))
+
+gene_fn <- "annot/PdMyb1.gene.bed"
+gene_d <- fread(gene_fn, header=FALSE, col.names=c("CHROM", "START", "END", "ELEMENT"))
+```
+
+## Identify outliers
+
+First, let's calculate the bonferroni threshold (alpha = 0.05)
+
+```{r bonferroni}
+a <- 0.05
+bonf_thresh <- a / nrow(dat[PHENO == "Qual_Int"])
+cat(str_interp("a = $[0.02f]{a}\n"))
+cat(str_interp("-log10( a_corrected ) = $[0.1f]{-log10(bonf_thresh)} \n"))
+```
+
+Now, report all SNPs below threshold
+```{r}
+print(dat[p_wald < bonf_thresh, ])
+```
+
+For all phenotypes, we have two snps below the threshold:
+- SNP1: 22302338
+- SNP2: 22302416
+
+Write the first SNP out
+```{r defineOutliers}
+outlier_snps <- dat[PHENO == "Qual_Int"][p_wald < bonf_thresh, ps[order(p_wald)]]
+cat(str_interp("$[d]{outlier_snps[1]}\n"), file="annot/PdMyb1.putative_snp.pos")
+```
+
+## Report log p values 
+```{r reportPvals}
+for(i in seq_along(outlier_snps)){
+    snp <- outlier_snps[i]
+    cat(str_interp("SNP${i}, pos = $[d]{snp}:\n"))
+    print(dat[ps == snp, .(PHENO, LOG10P=-log10(p_wald))])
+    cat("\n")
+}
+```
+## PVE: Regress phenotypes against outlier SNPs
+
+First we need genotypes at the SNPs
+```{r loadGTs}
+snp_gts <- list()
+for(pheno in pheno_nms){ 
+    tmp <- fread(str_interp("${gwas_prefix}.${pheno}.recode.traw"), header=TRUE, sep="\t", na.strings="NA")[POS %in% outlier_snps]
+
+    snp_gts[[pheno]] <- fread(str_interp("${gwas_prefix}.${pheno}.fam"), header=FALSE, col.names=c("FID", "IID", "PAT_ID", "MAT_ID", "SEX", "VAL"))
+    snp_gts[[pheno]][, PHENO := pheno]
+    fid_iid <- snp_gts[[pheno]][, str_c(FID, "_", IID)]
+    
+    for(i in seq_along(outlier_snps)){
+        new_col <- str_c("SNP", i)
+        new_val <- unlist(tmp[POS == outlier_snps[i], fid_iid, with=FALSE])
+        snp_gts[[pheno]][, eval(new_col) := new_val]
+    }
+}
+
+snp_gts <- rbindlist(snp_gts)
+```
+
+Now let's regress to get percent variance explained by each snp (PVE)
+
+```{r regression}
+calcPVE <- function(in_dat, xvar="SNP1", yvar="VAL"){
+    fmla <- as.formula(str_interp("${yvar} ~ ${xvar}"))
+    m <- lm(fmla, in_dat)
+    return(summary(m)$r.squared)
+}
+
+pve_res <- list()
+for(snp in c("SNP1", "SNP2")){
+    pve_res[[snp]] <- snp_gts[, .(R2 = calcPVE(.SD, snp, "VAL")), by=PHENO]
+    pve_res[[snp]][, SNP := snp]
+}
+pve_res <- rbindlist(pve_res)
+pve_res[, PVE := R2 * 100]
+print(pve_res)
+```
+
+
+## Load LD data at SNP1
+
+Let's load the R^2 results for SNP1 pairwise to all other snps.
+
+```{r loadLD}
+ld_prefix <- "results/pairwise_ld/merged.drum.filt.lmiss_0.5.imiss_0.9.polarized.bi"
+ld_pos <- fread(str_interp("${ld_prefix}.bim"), header=FALSE)$V4
+keep_col <- which(ld_pos == outlier_snps[1])
+
+ld_vals <- fread(str_interp("${ld_prefix}_ld.ld"), header=FALSE, select=keep_col)
+names(ld_vals) <- "RSQ"
+ld_vals[, ps := ld_pos]
+```
+
+What's R^2 between SNP1 and SNP2?
+
+```{r reportLD}
+x <- ld_vals[ps == outlier_snps[2], RSQ]
+cat(str_interp("R^2 between SNP1 and SNP2: $[0.2f]{x}\n"))
+```
+
+## Compute d/a ratios
+
+```{r daRatios}
+ComputeDA <- function(in_dat, snp){
+    tmp <- in_dat[, .(MEAN=mean(VAL)), by=get(snp)]
+    gt_means <- tmp[, MEAN]
+    names(gt_means) <- as.character(unlist(tmp[,1]))
+
+    out_vals <- list(   "A"=(gt_means["2"] - gt_means["0"])/2 ,
+                        "D"=gt_means["1"] - (gt_means["0"]+gt_means["2"])/2 )
+    out_vals[["RATIO"]] <- out_vals[["D"]] / out_vals[["A"]]
+    return(out_vals)
+}
+
+da_rat <- list()
+for(snp in c("SNP1", "SNP2")){
+    da_rat[[snp]] <- snp_gts[PHENO != "Qual_Int", ComputeDA(.SD, snp), by=PHENO]
+    da_rat[[snp]][, SNP := snp]
+}
+da_rat <- rbindlist(da_rat)
+
+print(da_rat)
+```
+
+
+## Plot results
+
+Need a function for transforming the -log10 transformation on the y-axis.
+
+```{r plotFuncs}
+neg_log10_trans <- function(){
+    scales::trans_new(
+        name = "neg_log10",
+        transform = function(x) -log10(x),
+        inverse = function(x) 10^(-x)
+    )
+}
+
+DrawExon <- function(p, center, height, coords, tipwidth=0, tipside="right", ...){
+    x <- c(coords[1], coords[1], coords[2]-tipwidth, coords[2], coords[2]-tipwidth)
+    y <- c(center-height/2, center+height/2, center+height/2, center, center-height/2)
+    if(tipside == "left"){
+        x_mid <- sum(range(x))/2
+        x <- (2 * x_mid) - x
+    } else if(tipside != "right"){
+        stop("arg *tipside* must be 'left' or 'right'")
+    }
+    p <- p + annotate("polygon", x=x, y=y, ...)
+    return(p)
+}
+```
+
+
+Manhattan plot (zoomed in)
+
+```{r plotManhatZoom, fig.width=8, fig.height=4.38}
+# Add R2 information to main data
+if(!("RSQ" %in% names(dat))){
+    dat <- merge(dat, ld_vals, by="ps", all.x=TRUE, all.y=FALSE)
+}
+
+zoom_window <- c(22299.5, 22303.5) # Window of zoomed in region in kb
+
+pwrs <- seq(0, -18, by=-2)
+brks <- 10 ^ pwrs
+labs <- sprintf("%d", -pwrs)
+
+p_manhatt <- list()
+for(pheno in pheno_nms){
+    p_manhatt[[pheno]] <- list()
+    p <- ggplot(dat[PHENO == pheno], aes(x=COORD, y=p_wald, fill=RSQ)) +
+        geom_point(alpha=1, pch=21, size=4, stroke=0.01) +
+        scale_fill_gradientn(name="r2 with SNP1", colors = c("white", "#b29ff9","#5605cb","red"),
+                            guide=guide_colorbar(frame.color="black", frame.linewidth=0.25, draw.ulim=FALSE, draw.llim=FALSE)) +
+        geom_hline(yintercept=bonf_thresh, linetype="dashed", color ='black')
+
+    # Annotate SNPs
+    for(i in 1:2){
+        p <- p + annotate(geom="text", x=outlier_snps[i]/1e3 - 0.1, y=dat[PHENO == pheno][ps == outlier_snps[i], p_wald], # SNP1 & SNP2
+            label=str_c("SNP", i), color=ifelse(i == 1, "red", "#5605cb"), hjust="left", family="Helvetica", fontface="bold")
+    }
+
+    use_margin <- theme_classic()$plot.margin
+    use_margin[3] <- unit(0, "points")
+
+    p <- p + scale_y_continuous(trans=neg_log10_trans(), breaks=brks, labels=labs) +
+        ylab(bquote(- log[10](p))) +
+        scale_x_reverse(limits=rev(zoom_window)) +
+        theme_classic() + 
+        theme(text=element_text(family="Helvetica"), 
+                legend.position="inside", legend.position.inside=c(0.87, 0.7))
+        
+
+
+    if(pheno != "Qual_Int"){
+        p_manhatt[[pheno]][["zoom"]] <- p
+    } else {
+        p_manhatt[[pheno]][["zoom"]] <- p + 
+            theme(plot.margin=use_margin,
+                axis.title.x=element_blank(), axis.line.x=element_blank(), 
+                axis.text.x=element_blank(), axis.ticks.x=element_blank())
+
+        # Make gene annotation image
+        gene_c <- 15
+        gene_h <- 10
+
+        seg_d <- data.table(X=zoom_window[1], XEND=zoom_window[2], Y=0, YEND=0)
+        p <- ggplot(seg_d) +
+            geom_segment(aes(x=X, xend=XEND, y=Y, yend=YEND), color="black",
+                    arrow=arrow(length=unit(0.1, "npc"), ends="both", angle=90)) +
+            annotate(geom="text", x=zoom_window[1]+0.05, y=-3, label="5 kb", hjust="right", vjust="top", size=3.5)
+
+        exon_d <- gene_d[str_starts(ELEMENT, "exon")]
+        exon_d[, START := START/1e3]
+        exon_d[, END   := END/1e3]
+        gene_lim <- exon_d[, range(c(START,END))]
+        p <- p + annotate(geom="segment", x=gene_lim[1], xend=gene_lim[2], y=gene_c, yend=gene_c, color="black")
+        for(elem in exon_d$ELEMENT){
+            if(elem == "exon3"){
+                tw <- diff(gene_lim) * 0.03
+            } else {
+                tw <- 0
+            }
+            p <- DrawExon(p, center=gene_c, height=gene_h, coords=exon_d[ELEMENT==elem, c(START, END)], tipwidth=tw, tipside="left", color="black", fill="gray")
+        }
+
+        use_margin <- theme_classic()$plot.margin
+        use_margin[1] <- unit(0, "points")
+
+        # Text: PdMyb1
+        p <- p + annotate(geom="text", x=median(gene_lim), y=gene_c + gene_h/2 + 1.5, label="PdMyb1", hjust="center", family="Helvetica", fontface="italic", size=3.5) +
+            scale_x_reverse(limits=rev(zoom_window)) +
+            ylim(-20, gene_c + gene_h/2 + 3) +
+            theme_classic() +
+            theme(axis.title=element_blank(), axis.line=element_blank(), 
+                    axis.text=element_blank(), axis.ticks=element_blank(),
+                    plot.margin=use_margin)
+        p_manhatt[[pheno]][["gene"]] <- p
+
+        p <- p_manhatt[[pheno]][["zoom"]] + p_manhatt[[pheno]][["gene"]] + plot_layout(nrow=2, heights=c(10, 2))
+
+        # ggsave(p, file="tmp.pdf", width=8, height=4.38)
+        print(p + ggtitle(pheno))
+    }
+}
+```
+
+Manhattan plot, wide view
+
+```{r plotManhatWide, fig.width=15, fig.height=2.5}
+pwrs <- seq(0, -16, by=-4)
+brks <- 10 ^ pwrs
+labs <- sprintf("%d", -pwrs)
+
+for(pheno in pheno_nms){
+    p <- ggplot(dat[PHENO == pheno], aes(x=COORD, y=p_wald)) +
+        geom_point(alpha=1, pch=20, size=3, color="grey70") +
+        geom_hline(yintercept=bonf_thresh, linetype="dashed", color ='black') +
+        geom_vline(xintercept=zoom_window[1], linetype="dashed", color="grey40") +
+        geom_vline(xintercept=zoom_window[2], linetype="dashed", color="grey40") +
+        scale_y_continuous(trans=neg_log10_trans(), breaks=brks, labels=labs) +
+        ylab(bquote(- log[10](p))) +
+        ggtitle(expression(paste("35 kb window of chrlg6 at ", italic("PdMyb1")))) +
+        scale_x_reverse(name="Position (kb)", limits=bed_d[,rev(c(START, END)/1e3)]) +
+        theme_classic() + 
+        theme(text=element_text(family="Helvetica"), plot.title=element_text(family="Helvetica", hjust=0.5))
+        
+    print(p + ggtitle(pheno))
+    # ggsave(p, file="tmp.pdf", width=15, height=2.5)
+    p_manhatt[[pheno]][["wide"]] <- p
+}
+```
+
+Before we make box plots we need the alleles for the snps (for the x axes). 
+
+Note we reverse complement because the gene is on the negative strand
+
+```{r getAlleles}
+RevComplement <- function(x){
+    x <- toupper(x)
+    x <- str_replace_all(x, "A", "t")
+    x <- str_replace_all(x, "C", "g")
+    x <- str_replace_all(x, "G", "c")
+    x <- str_replace_all(x, "T", "a")
+    x <- toupper(x)
+    x <- stringi::stri_reverse(x)
+    return(x)
+}
+
+outlier_gts <- list()
+for(i in seq_along(outlier_snps)){
+    alleles <- unlist(dat[PHENO == "Qual_Int"][ps == outlier_snps[i]][, .(allele0, allele1)])
+    alleles <- RevComplement(alleles)
+    outlier_gts[[str_c("SNP", i)]] <- c(str_interp("${alleles[1]}/${alleles[1]}"), str_interp("${alleles[2]}/${alleles[1]}"), str_interp("${alleles[2]}/${alleles[2]}"))
+}
+```
+
+Now we can plot
+
+```{r plotBoxPlots, fig.width=5, fig.height=6}
+p_box <- list()
+for(pheno in str_subset(pheno_nms, "^Quant")){
+    p_box[[pheno]] <- list()
+    for(snp in str_c("SNP", 1:2)){
+        plt_d <- merge(snp_gts[PHENO == "Qual_Int", .(IID, INTENSITY=ifelse(VAL==1, "Light", "Dark"))], snp_gts[PHENO == pheno], by="IID")
+        plt_d[, eval(snp) := as.character(get(snp))]
+        
+        pve <- pve_res[PHENO==pheno][SNP==snp,PVE]
+        da  <- da_rat[PHENO==pheno][SNP==snp, RATIO]
+
+        use_title <- str_interp("PVE = $[0.1f]{pve}\nd/a = $[0.2f]{da}")
+
+        p_box[[pheno]][[snp]] <- ggplot(data=plt_d, aes(x=.data[[snp]], y=VAL)) +
+            geom_beeswarm(aes(color=INTENSITY), dodge.width=0, cex=2, size=2) +
+            geom_boxplot(outlier.shape=NA,fill=NA)  + 
+            stat_summary(fun.y="mean",color="red", shape=13) + 
+            scale_x_discrete(labels=outlier_gts[[snp]]) +
+            scale_color_manual(values=c("Light"="#b29ff9", "Dark"="#5605cb")) +
+            ggtitle(use_title) +
+            theme_classic() +
+            theme(text=element_text(family="Helvetica"), plot.title=element_text(hjust=0.5, vjust=-4, size=10))
+    }
+}
+
+pA <- p_box[["Quant_Int_Bright"]][["SNP1"]] + ylab("Brightness") + theme(axis.text.x=element_blank(), axis.title.x=element_blank(), legend.position="none")
+pB <- p_box[["Quant_Int_Bright"]][["SNP2"]] + theme(axis.text=element_blank(), axis.title=element_blank(), axis.ticks.y=element_blank(), axis.line.y=element_blank(), legend.position="none")
+pC <- p_box[["Quant_Chroma"]][["SNP1"]] + ylab("Chroma") + xlab("SNP1") + theme(legend.position=c(0.8, 0.2), legend.title=element_blank())
+pD <- p_box[["Quant_Chroma"]][["SNP2"]] + xlab("SNP2") + theme(axis.text.y=element_blank(), axis.title.y=element_blank(), axis.ticks.y=element_blank(), axis.line.y=element_blank(), legend.position="none")
+
+
+
+p <- pA + pB + pC + pD + plot_layout(nrow=2, byrow=TRUE)
+
+# ggsave(p, file="tmp.pdf", width=5, height=6)
+print(p)
+```
+
+## Figure 3 plot (upper half)
+```{r jointPlot, fig.width=10, fig.height=6}
+AdjustMargin <- function(p, side, newval=0){
+    use_margin <- p$theme$plot.margin
+    if(str_detect(side, "t")){
+        use_margin[1] <- unit(newval, "points")
+    }
+    if(str_detect(side, "r")){
+        use_margin[2] <- unit(newval, "points")
+    }
+    if(str_detect(side, "b")){
+        use_margin[3] <- unit(newval, "points")
+    }
+    if(str_detect(side, "l")){
+        use_margin[4] <- unit(newval, "points")
+    }
+    
+    return(p + theme(plot.margin=use_margin))
+}
+
+pA  <- AdjustMargin(p_manhatt[["Qual_Int"]][["wide"]], "tb", 0)
+pB1 <- AdjustMargin(p_manhatt[["Qual_Int"]][["zoom"]], "tb", 0)
+pB2 <- AdjustMargin(p_manhatt[["Qual_Int"]][["gene"]], "t", 0)
+pC1 <- AdjustMargin(p_box[["Quant_Int_Bright"]][["SNP1"]], "tb", 0) + 
+        ylab("Brightness") + 
+        theme(axis.text.x=element_blank(), axis.title.x=element_blank(), legend.position="none")
+pC2 <- AdjustMargin(p_box[["Quant_Chroma"]][["SNP1"]], "tb", 0) + 
+        ylab("Chroma") + xlab("SNP1") + 
+        theme(legend.position=c(0.8, 0.2), legend.title=element_blank(), legend.background=element_blank())
+
+# Full plot height and width
+h <- 60
+w <- 100
+
+# Aspect ratios (width / height)
+hA <- 16
+hB1 <- 54
+wB <- 70
+
+des <- c(area(t=1,            l=1,    b=hA,         r=w),
+         area(t=hA+1,         l=1,    b=hB1,        r=wB),
+         area(t=hB1+1,        l=1,    b=h,          r=wB),
+         area(t=hA+1,         l=wB+2, b=(h + hA)/2, r=w),
+         area(t=(h + hA)/2+1, l=wB+2, b=h,          r=w))
+
+p <- pA + pB1 + free(pB2, side="b") + pC1 + pC2 + plot_layout(design=des)
+ggsave(p, file="figure3.upper.pdf", width=w/10, height=h/10)
+print(p)
+```
+
+## Figure S7 plot (GWAS for other color phenotype measures)
+```{r suppPlot, fig.width=16, fig.height=10}
+pA <- p_manhatt[["Quant_Int_Bright"]][["wide"]] + ggtitle("A") + theme(plot.title=element_text(family="Helvetica", size=30, hjust=0))
+pB <- p_manhatt[["Quant_Chroma"]][["wide"]]     + ggtitle("B") + theme(plot.title=element_text(family="Helvetica", size=30, hjust=0))
+pC <- p_manhatt[["Quant_Int_Bright"]][["zoom"]] + ggtitle("C") + theme(plot.title=element_text(family="Helvetica", size=30, hjust=0)) +
+    xlab("Position (kb)")
+pD <- p_manhatt[["Quant_Chroma"]][["zoom"]] + ggtitle("D") + theme(plot.title=element_text(family="Helvetica", size=30, hjust=0)) +
+    xlab("Position (kb)")
+
+#layout <- "
+#AAAA
+#BBBB
+#CCDD
+#"
+#p <- pA + pB + pC + pD + plot_layout(design = layout)
+p <- pA / pB / (pC | pD) + plot_layout(heights=c(1, 1, 1.5))
+
+ggsave(p, file="figureS7.pdf", width=16, height=10)
+
+print(p)
+```
+
+(Save R Data for debugging)
+
+```{r saveData}
+if(TRUE){
+    save.image("figure3.Rdata")
+}
+```

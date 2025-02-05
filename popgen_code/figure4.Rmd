@@ -1,0 +1,758 @@
+---
+title: "Figure 4"
+date: "2024-09-26"
+output: html_document
+---
+
+# Load packages
+
+```{r loadPkg, message=FALSE}
+# Install packages
+req_pkgs <- c("data.table", "stringr", "ggpubr", "rehh", "vcfR", "patchwork", "grid")
+for(pkg in req_pkgs){
+    if(!require(pkg, character.only=TRUE)){install.packages(pkg, repos="https://cloud.r-project.org/"); library(pkg, character.only=TRUE)}
+}
+```
+
+# Set output directory
+
+```{r setOutput}
+out_dir <- "results/figure4"
+if(!dir.exists(out_dir)){
+    dir.create(out_dir, recursive=TRUE)
+}
+```
+
+# Load annotations
+
+```{r loadAnnot}
+bed_fn <- "results/bcf_pipe/call/drum.hi_dep_region.bed"
+bed_d <- fread(bed_fn, header=FALSE, col.names=c("CHROM", "START", "END"))
+
+gene_fn <- "annot/PdMyb1.gene.bed"
+gene_d <- fread(gene_fn, header=FALSE, col.names=c("CHROM", "START", "END", "ELEMENT"))
+
+snp_fn <- "annot/PdMyb1.putative_snp.pos"
+snp_pos <- as.numeric(fread(snp_fn, header=FALSE)$V1)
+```
+
+# Load metadata
+
+```{r loadMet}
+met_d <- fread("config/drum.metadata.tsv", header=TRUE, sep="\t")
+```
+
+# LD Data
+Load pairwise LD data. This can take some time (and requires a sizable chunk of memory) 
+due to all the pairwise comparisons. Provided some code for saving the post-processed results 
+as an Rdata object to save time for future runs.
+
+```{r loadLD}
+ld_prefix <- "results/pairwise_ld/merged.drum.filt.lmiss_0.5.imiss_0.9.polarized.bi_ld"
+md5str <- system(str_interp("md5sum ${ld_prefix}.ld | cut -f 1 -d ' '"), intern = TRUE)
+ld_rdat <- str_interp("${ld_prefix}.${md5str}.RData")
+if(file.exists(ld_rdat)){
+    load(ld_rdat)
+} else {
+    snp_dat <- fread(str_interp("${ld_prefix}.frq.counts"), header=TRUE)
+    snp_dat[, POS := as.numeric(tstrsplit(SNP, ":")[[2]])]
+    snp_dat[, INDEX := .I]
+    
+    # Ensure only variable sites
+    snp_dat <- snp_dat[C1 != 0]
+    keep_i <- snp_dat[,INDEX]
+    
+    rsq_mat <- fread(str_interp("${ld_prefix}.ld"), header=FALSE, sep="\t", na.strings="nan", select=keep_i)
+    rsq_mat <- as.matrix(rsq_mat[keep_i])
+    
+    rownames(rsq_mat) <- snp_dat[, str_c("P", POS)]
+    colnames(rsq_mat) <- rownames(rsq_mat)
+}
+```
+
+To simplify things, let's aggregate the data by taking mean R^2 every 50 bp
+
+Note that the `AggregateRsq` function computes multiple summary stats but we'll just be
+plotting arithmetic mean.
+```{r procLD}
+if(!("ld_aggr" %in% ls())){
+    binwidth <- 50
+    breaks <- bed_d[, seq(START, END, by=binwidth)]
+    breaks <- breaks[1:(max(which(breaks < gene_d[, max(END)])) + 1)]
+    bins <- (breaks[-length(breaks)] + breaks[-1]) / 2
+    nbins <- length(bins)
+    
+    snp_dat[, BIN_INDEX := as.integer(cut(POS, breaks=breaks, labels=bins))]
+    snp_dat[, RN := .I]
+    setkey(snp_dat, BIN_INDEX)
+    
+    
+    ld_aggr <- data.table(BIN_I_X = unlist(sapply(1:nbins, function(x) rep(x, nbins - x + 1))),
+                        BIN_I_Y = unlist(sapply(1:nbins, function(x) x:nbins)))
+    
+    AggregateRsq <- function(bin_x, bin_y){
+        rn <- snp_dat[.(bin_x), RN]
+        cn <- snp_dat[.(bin_y), RN]
+        cur_vals <- rsq_mat[rn, cn]
+        
+        if(all(is.na(cur_vals))){
+            out_list <- list(NA, NA, NA, NA)
+        } else {
+            min_val <- min(cur_vals, na.rm=TRUE)
+            max_val <- max(cur_vals, na.rm=TRUE)
+            med_val <- median(cur_vals, na.rm=TRUE)
+            mean_val <- mean(cur_vals, na.rm=TRUE)
+            out_list <- list(min_val, max_val, med_val, mean_val)
+        }
+        
+        return(out_list)
+    }
+    
+    ld_aggr[, INDEX := .I]
+    uniq_bin_index <- snp_dat[, unique(BIN_INDEX)]
+    
+    ld_aggr[  (BIN_I_X %in% uniq_bin_index) & (BIN_I_Y %in% uniq_bin_index), 
+            c("MIN", "MAX", "MED", "MEAN") := AggregateRsq(BIN_I_X, BIN_I_Y), 
+            by=INDEX]
+    
+    ld_aggr[, POS_X := bins[BIN_I_X]]
+    ld_aggr[, POS_Y := bins[BIN_I_Y]]
+    
+    save(ld_aggr, binwidth, file=ld_rdat)
+}
+```
+
+# Haplotype data
+
+## Load haplotype data
+
+Load haplotypes. Note that we load the data twice, once with 
+`polarize_vcf = TRUE` for EHH analyses + F&W's H and once with 
+`polarize_vcf = FALSE` for Tajima's D analyses. This allows us to retain 
+maximal data since `polarize_vcf = TRUE` drops data without any
+ancestral allele annotation (`INFO/AA` field) and this information
+is not necessary for our Tajima's D analyses.
+
+```{r loadHaps}
+vcf_fn <- "results/snp_postproc/merged.drum.filt.lmiss_0.5.imiss_0.9.polarized.phased.vcf.gz"
+hh <- list()
+for(a in c("T", "F")){
+    hh[[a]] <- data2haplohh( hap_file = vcf_fn,
+                            vcf_reader = "vcfR",
+                            polarize_vcf = (a == "T"),
+                            verbose = TRUE,
+                            min_perc_geno.mrk = 50)
+}
+
+# Keep metadata on samples that are in vcf
+keep_samps <- str_remove(rownames(hh[["T"]]@haplo)[(1:nrow(hh[["T"]]@haplo)) %% 2 == 1], "_1$")
+met_d <- met_d[Individual %in% keep_samps]
+```
+
+Break haplotype data down by subregion. First create a function for subsetting haplotypes by samples
+
+```{r subsetHaplo}
+SubsetHaplo <- function(in_hh, sampnames, ...){
+    hnames <- str_c(rep(sampnames, 2), c(rep("_1", length(sampnames)), rep("_2", length(sampnames))))
+    keep_rows <- which(rownames(in_hh@haplo) %in% hnames)
+    return(subset(in_hh, select.hap=keep_rows, ...))
+}
+```
+
+Now let's look at each subregion in isolation ... 
+
+```{r regionEHH, fig.width=4, fig.height=3}
+hh_sub <- list()
+for(a in names(hh)){
+    hh_sub[[a]] <- list()
+    for(reg in c(unique(met_d$region), "symp_allo")){
+        if(reg == "symp_allo"){
+            keep_samps <- met_d[region %in% c("Sympatry", "Allopatry"), Individual]
+        } else {
+            keep_samps <- met_d[region == reg, Individual]
+        }
+        
+        hh_sub[[a]][[reg]] <- SubsetHaplo(hh[[a]], sampnames=keep_samps, min_perc_geno.mrk=50)
+    }
+}
+
+scan_sub <- list()
+# ihs_sub <- list()
+ehh_sub <- list()
+for(reg in names(hh_sub[["T"]])){
+    scan_sub[[reg]] <- scan_hh(hh_sub[["T"]][[reg]], discard_integration_at_border = FALSE)
+    # ihs_sub[[reg]] <- ihh2ihs(scan_sub[[reg]], verbose=TRUE, freqbin=4)
+    
+    ehh_sub[[reg]] <- calc_ehh(hh_sub[["T"]][[reg]], mrk=which(hh_sub[["T"]][[reg]]@positions == snp_pos), include_nhaplo=TRUE)
+    plot(ehh_sub[[reg]])
+    title(sub=str_interp("EHH around SNP1, ${reg}"))
+}
+```
+
+## Process haplotype data
+
+### XP-EHH (Cross-population EHH) Sympatry vs Allopatry
+
+Calculate pairwise RSB and XP-EHH and identify outliers
+
+```{r symalloXP}
+xpehh_sym_allo <- ies2xpehh(scan_pop1 = scan_sub[["Sympatry"]],
+                            scan_pop2 = scan_sub[["Allopatry"]],
+                            popname1 = "SYMP",
+                            popname2 = "ALLO")
+xpehh_sym_allo <- as.data.table(xpehh_sym_allo)
+
+# Save XP-EHH results
+out_fn <- str_c(out_dir, "/xpehh_sym_allo.tsv")
+cat("Writing xpehh_sym_allo to\n", out_fn, "\n", sep="")
+fwrite(xpehh_sym_allo, file=out_fn, sep="\t", row.names=FALSE, col.names=TRUE, quote=FALSE)
+
+# ID outliers
+cr2 <- calc_candidate_regions(xpehh_sym_allo, threshold = 2, ignore_sign = TRUE, window_size = 1)
+```
+
+
+
+### SFS tests
+
+Calculate SFS tests
+
+```{r calcSFS}
+# Calculate SFS for different regions
+sfs_res <- list()
+
+for(a in names(hh)){
+    sfs_res[[a]] <- list()
+    for(reg in names(hh_sub[[a]])){
+        sfs_res[[a]][[reg]] <- as.data.table(calc_sfs_tests(hh_sub[[a]][[reg]], polarized=(a == "T"), window_size=500, overlap=250, verbose=TRUE))
+        sfs_res[[a]][[reg]][N_MRK == 0, c("TAJIMA_D", "FAY_WU_H") := list(NA, NA)]
+    }
+}
+
+# Save Tajima's D and Fay & Wu's H
+# Note that we use unpolarized data for Tajima's D (since polarization 
+# is not required and this us gives more data) and polarized data for Fay & Wu's H
+out_d <- list()
+for(reg in names(sfs_res[["F"]])){
+    out_d[[reg]] <- sfs_res[["F"]][[reg]][, .(CHR, START, END, N_MRK, TAJIMA_D)]
+    out_d[[reg]][, REGION := reg]
+}
+out_d <- rbindlist(out_d)
+out_fn <- str_c(out_dir, "/TAJIMA_D.polarized_F.tsv")
+cat("Writing TAJIMA_D to\n", out_fn, "\n", sep="")
+fwrite(out_d, file=out_fn, sep="\t", row.names=FALSE, col.names=TRUE, quote=FALSE)
+
+out_d <- list()
+for(reg in names(sfs_res[["T"]])){
+    out_d[[reg]] <- sfs_res[["T"]][[reg]][, .(CHR, START, END, N_MRK, FAY_WU_H)]
+    out_d[[reg]][, REGION := reg]
+}
+out_d <- rbindlist(out_d)
+out_fn <- str_c(out_dir, "/FAY_WU_H.polarized_T.tsv")
+cat("Writing FAY_WU_H to\n", out_fn, "\n", sep="")
+fwrite(out_d, file=out_fn, sep="\t", row.names=FALSE, col.names=TRUE, quote=FALSE)
+```
+
+# Pi, Fst Data
+
+## Load pi and fst data
+
+These results were calculated using pixy
+
+```{r}
+keep_pops <- c("Allopatry", "Sympatry", "cusp")
+grp <- "region"
+
+pixy_statnames <- c("pi"="avg_pi", "fst"="avg_wc_fst")
+
+pixy_d <- list()
+for(x in names(pixy_statnames)){
+    fn <- str_interp("results/pixy/pixy.${grp}_${x}.txt")
+    pixy_d[[x]] <- fread(fn, header=TRUE, sep="\t")
+    if(x == "fst"){
+        pixy_d[[x]] <- pixy_d[[x]][pop1 %in% keep_pops & pop2 %in% keep_pops]
+    } else {
+        pixy_d[[x]] <- pixy_d[[x]][pop %in% keep_pops]
+    }
+    setnames(pixy_d[[x]], c("window_pos_1", "window_pos_2"), c("START", "END"))
+    pixy_d[[x]][, chr_position := (START + END) / 2]
+}
+
+# Set data values to NA 
+pixy_miss <- list()
+for(p in keep_pops){
+    fn <- str_interp("results/pixy/pixy.${grp}.NS_${p}.bed")
+    tmp <- fread(fn, header=FALSE, sep="\t", col.names=c("CHROM", "START", "END", "NS"))
+    miss_start <- tmp[NS == 0, START]
+    for(x in names(pixy_statnames)){
+        statnm <- pixy_statnames[x]
+        if(x == "pi"){
+            pixy_d[[x]][(pop == p) & (START %in% miss_start), eval(statnm) := NA]
+        } else {
+            pixy_d[[x]][(pop1 == p | pop2 == p) & (START %in% miss_start), eval(statnm) := NA]
+        }
+    }
+}
+```
+
+
+
+# Build subbplots
+
+We have a number of subbplots to put together into a final figure
+
+## Plotting functions
+```{r plotFuncs}
+ScaleCoordinate <- function(x, u=1e6, from_snp=FALSE){
+    # x: Unscaled chromosomal positions
+    if(from_snp){
+        # Convert to units relative to snp position
+        y <- snp_pos - x
+    } else {
+        y <- x
+    }
+    y <- y / u
+    return(y)
+}
+
+AnnotateStdDev <- function(p, y=2){
+    p <- p + 
+        geom_hline(yintercept = y, color = "gray40", linetype = "dashed") +
+        geom_hline(yintercept = -y, color = "gray40", linetype = "dashed") +
+        geom_hline(yintercept = 0, color = "black", linetype = "dotted")
+    return(p)
+}
+
+AnnotateGene <- function(p, y=-2.98, w=3.5, snp_only=FALSE, exon_col="black", ...){
+    # y: exon position along y-axis
+    # u: units on x-axis (default 1 Mb)
+    # Annotate snp
+    p <- p + 
+        geom_vline(xintercept = ScaleCoordinate(snp_pos, ...), color = "red", linetype = "dashed")
+    
+    # Annotate exons
+    if(!snp_only){
+        xx <- ScaleCoordinate(gene_d[str_starts(ELEMENT, "exon"), c(min(START), max(END))], ...)
+        p <- p + annotate(geom="segment", 
+                    x=xx[1], y=y,
+                    xend=xx[2], yend=y,
+                    size=w/7, color=exon_col)
+        
+        for(elem in gene_d$ELEMENT){
+            if(str_starts(elem, "exon")){
+                xx <- ScaleCoordinate(gene_d[ELEMENT == elem, c(START+1, END)], ...)
+                p <- p + 
+                    annotate(geom="segment",
+                        x = xx, y = y,
+                        xend = xx[2], yend = y,
+                        size = w, color = exon_col)
+            }
+        }
+    }
+    return(p)
+}
+
+GroupLines <- function(x){
+    # Assumes data is already sorted
+    na_data <- is.na(x) | is.null(x)
+
+    grp_ends <- which(na_data) - 1
+    grp_ends <- grp_ends[grp_ends > 1]
+    grp_ends <- grp_ends[!na_data[grp_ends]]
+
+    grp_starts <- which(na_data) + 1
+    grp_starts <- grp_starts[grp_starts < length(na_data)]
+    grp_starts <- grp_starts[!na_data[grp_starts]]
+ 
+   if(!na_data[1]){
+        grp_starts <- c(1, grp_starts)
+    }
+    if(!na_data[length(na_data)]){
+        grp_ends <- c(grp_ends, length(na_data))
+    }
+    
+    out_val <- rep(as.integer(NA), length(na_data))
+    for(i in seq_along(grp_starts)){
+        out_val[grp_starts[i]:grp_ends[i]] <- as.integer(i)
+    }
+    return(out_val)
+}
+```
+
+## Plotting parameters
+```{r plotParams}
+plt_x_from_snp <- TRUE
+plt_x_units <- ifelse(plt_x_from_snp, 1e3, 1e6)
+plt_xlim <- ScaleCoordinate(c(22.295e6, 22.305e6), plt_x_units, plt_x_from_snp) # xlimits of plots
+pos_xlab <- ifelse(plt_x_from_snp, "distance from SNP1 (kb)", "chrlg6 coordinate (Mb)")
+
+
+allosymp_color <- c("Allopatry" = "#DBD0FF", "Sympatry" = "#8C67E4")
+lo_color <- "#FBFFBD"
+hi_color <- "#8C67E4"
+line_size <- 1
+
+exon_col <- "#666666"
+```
+
+## Fst subplot
+
+```{r subplotFst}
+plt_d <- pixy_d[["fst"]] #[no_snps > min_snps[["fst"]]]
+
+# Make comparison names
+plt_d[, Comparison := str_c(pop1, "/", pop2)]
+plt_d[, Comparison := factor(Comparison, levels=c("Allopatry/cusp", "Sympatry/cusp", "Sympatry/Allopatry"))]
+
+plt_d[, COORDINATE := ScaleCoordinate(chr_position, u=plt_x_units, from_snp=plt_x_from_snp)]
+
+# Group so that lines are not drawn across NA windows
+setorder(plt_d, Comparison, START, END)
+#plt_d[, LINEGRP := str_c(Comparison[1], GroupLines(avg_wc_fst)), by=Comparison]
+#plt_d <- plt_d[!is.na(avg_wc_fst)]
+
+use_col <- allosymp_color
+names(use_col) <- str_c(names(use_col), "/cusp")
+x <- as.vector(plt_d[pop1 != "cusp" & pop2 != "cusp", Comparison][1])
+use_col[x] <- "#000000"
+
+p <- ggplot(plt_d, aes(x = COORDINATE, y = avg_wc_fst, color = Comparison)) +
+    geom_hline(yintercept=0, color="black", linetype="dotted") +
+    geom_line(size = line_size) +
+    xlab(pos_xlab) +
+    ylab(bquote(F[st])) +
+    theme_pubr() +
+    scale_color_manual(values = use_col)
+
+if(plt_x_from_snp){
+    p <- p + xlim(rev(plt_xlim))
+} else {
+    p <- p + scale_x_reverse(limits=rev(plt_xlim))
+}
+
+p <- AnnotateGene(p, y=-0.13, u=plt_x_units, from_snp=plt_x_from_snp, exon_col=exon_col)
+
+p_fst <- p
+print(p_fst)
+```
+
+## Pi subplot
+```{r subplotPi}
+plt_d <- pixy_d[["pi"]][pop %in% names(allosymp_color)] #[no_snps > min_snps[["fst"]]]
+setnames(plt_d, "pop", "Population")
+
+# Group so that lines are not drawn across NA windows
+setorder(plt_d, Population, START, END)
+#plt_d[, LINEGRP := str_c(Population, GroupLines(avg_pi)), by=Population]
+#plt_d <- plt_d[!is.na(avg_pi)]
+
+plt_d[, COORDINATE := ScaleCoordinate(chr_position, u=plt_x_units, from_snp=plt_x_from_snp)]
+
+p <- ggplot(plt_d, aes(x = COORDINATE, y = avg_pi, color = Population)) +
+    geom_hline(yintercept=0, color="black", linetype="dotted") +
+    geom_line(size = line_size) +
+    xlab(pos_xlab) +
+    scale_y_continuous(labels = scales::percent) +
+    ylab(bquote("Nucleotide diversity" ~ (pi))) +
+    theme_pubr() +
+    scale_color_manual(values = allosymp_color)
+if(plt_x_from_snp){
+    p <- p + xlim(rev(plt_xlim))
+} else {
+    p <- p + scale_x_reverse(limits=rev(plt_xlim))
+}
+
+p <- AnnotateGene(p, y=-0.005, u=plt_x_units, from_snp=plt_x_from_snp, exon_col=exon_col)
+
+p_pi <- p
+print(p_pi)
+```
+
+## Tajima's D and Fay and Wu's H subplots
+```{r subbplotSFS}
+# meas_vars <- c("TAJIMA_D"="Tajima's D", "FAY_WU_H"="Fay & Wu's H")
+
+plt_d <- list()
+for(reg in names(allosymp_color)){
+    tmp <- list()
+    tmp[["TAJ"]] <- sfs_res[["F"]][[reg]][, .(START, END, value=TAJIMA_D, statistic_name="Tajima's D", Population=reg)]
+    tmp[["FAY"]] <- sfs_res[["T"]][[reg]][, .(START, END, value=FAY_WU_H, statistic_name="Fay & Wu's H", Population=reg)]
+    plt_d[[reg]] <- rbindlist(tmp)
+}
+plt_d <- rbindlist(plt_d)
+plt_d[, chr_position := ScaleCoordinate((START + END) / 2, u=plt_x_units, from_snp=plt_x_from_snp)]
+
+p_sfs <- list()
+for(v in unique(plt_d[, statistic_name])){
+    # v <- meas_vars[nm]
+    p <- ggplot(plt_d[statistic_name == v], aes(x = chr_position, y = value, color = Population))
+    p <- AnnotateStdDev(p) +
+        geom_line(size = line_size) +
+        xlab(pos_xlab) +
+        ylab(v) +
+        theme_pubr() +
+        scale_color_manual(values = allosymp_color) +
+        ylim(-3,3)
+    if(plt_x_from_snp){
+        p <- p + xlim(rev(plt_xlim))
+    } else {
+        p <- p + scale_x_reverse(limits=rev(plt_xlim))
+    }
+    
+    p <- AnnotateGene(p, u=plt_x_units, from_snp=plt_x_from_snp, exon_col=exon_col)
+    
+    nm <- substr(v, 1, 3)
+    p_sfs[[nm]] <- p
+    print(p_sfs[[nm]])
+}
+```
+
+## LD subplot
+
+Prep data
+
+```{r plotprepMean}
+zoom_width <- 2e3
+plt_stat <- "MEAN"
+color_scale <- "limited"
+
+ymin_zoom <- snp_pos - (snp_pos %% binwidth) - zoom_width/2
+ymax_zoom <- snp_pos - (snp_pos %% binwidth) + zoom_width/2 + binwidth
+
+p_ld <- list()
+for(zoomed in c(FALSE, TRUE)){
+    if(zoomed){
+        ymin <- ymin_zoom
+        ymax <- ymax_zoom
+    } else {
+        ymin <- min(ld_aggr[["POS_Y"]])
+        ymax <- max(ld_aggr[["POS_Y"]]) + 10*binwidth
+    }
+    
+    p <- ggplot()
+    
+    # Draw gene body
+    gene_range <- gene_d[ELEMENT != "promoter", sort(range(c(START, END)))]
+    gene_range[gene_range < ymin] <- ymin
+    gene_range[gene_range > ymax] <- ymax
+    p <- p + annotate("line", x=gene_range, y=rep(ymax, 2), color=exon_col, linewidth=ifelse(zoomed, 2/7, 3/7))
+    for(i in 1:nrow(gene_d)){
+        if(gene_d[i, ELEMENT] == "promoter"){ next }
+        reg <- as.numeric(gene_d[i, c(START+1, END)])
+        reg[reg < ymin] <- ymin
+        reg[reg > ymax] <- ymax
+            
+        p <- p + annotate("line", x=reg, y=rep(ymax, 2), color=exon_col, linewidth=ifelse(zoomed, 2, 3))
+    }
+    # Annotate snp
+    arrow_len <- ifelse(zoomed, 120, 600)
+    p <- p + annotate("segment", x=snp_pos, xend=snp_pos, y=ymax+arrow_len*0.7, yend=ymax-arrow_len*0.3, arrow=arrow(length=unit(0.07, "inches")), color="red")
+    
+    if(zoomed){
+        cur_plt <- ld_aggr[(POS_Y >= ymin) & (POS_Y <= (ymax - binwidth)) & (POS_X >= ymin) & (POS_X <= (ymax - binwidth))]
+        use_guide <- "none"
+    } else {
+        cur_plt <- ld_aggr[1:.N]
+        use_guide <- guide_colorbar(title=bquote("Mean" ~ r^2), barwidth=unit(2, "inches"), draw.ulim=FALSE, draw.llim=FALSE)
+    }
+    p <- p + geom_tile(aes(x=POS_X, y=POS_Y, fill=.data[[plt_stat]]), data=cur_plt)
+    
+    if(color_scale == "linear"){
+        p <- p + 
+            scale_fill_gradient(low=lo_color, high=hi_color, 
+                                breaks=c(0, 0.25, 0.5, 0.75, 1.0),
+                                limits=c(0, 1),
+                                guide=use_guide)
+    } else if(color_scale == "log"){
+        p <- p + 
+            scale_fill_gradient(low=lo_color, high=hi_color, 
+                                trans=scales::pseudo_log_trans(sigma=0.001), 
+                                breaks=c(0, 0.01, 0.1, 1.0),
+                                limits=c(0, 1),
+                                guide=use_guide)
+        
+    } else if(color_scale == "limited"){
+        p <- p +
+            scale_fill_gradient(low=lo_color, high=hi_color,
+                                breaks=c(0, 0.1, 0.2, 0.3, 0.4, 0.5),
+                                labels=c("0", "0.1", "0.2", "0.3", "0.4", "> 0.5"),
+                                limits=c(0, 0.5),
+                                guide=use_guide)
+    }
+    
+    if(zoomed){
+        p <- p + 
+            scale_x_reverse() +
+            scale_y_reverse() +
+            guides(y.sec="axis") +
+            theme(  axis.title.x=element_blank(),
+                    axis.text.x=element_blank(),
+                    axis.ticks.x=element_blank(),
+                    axis.line.x.top=element_blank(),
+                    axis.line.x.bottom=element_line(color="black", linewidth=1, lineend="round"),
+                    axis.title.y=element_blank(),
+                    axis.text.y=element_blank(),
+                    axis.ticks.y=element_blank(),
+                    axis.line.y.left=element_blank(),
+                    axis.line.y.right=element_line(color="black", linewidth=1, lineend="round"),
+                    panel.background=element_blank(),
+                    plot.background=element_blank())
+    } else {
+        if(plt_x_from_snp){
+            use_breaks <- snp_pos + seq(10, -12, by=-2) * 1e3
+        } else {
+            use_breaks <- c(22290000, 22295000, 22300000, 22305000, 22310000)
+        }
+        use_labels <- ScaleCoordinate(use_breaks, u=plt_x_units, from_snp=plt_x_from_snp)
+        
+        p <- p + 
+            scale_x_continuous(name=pos_xlab, breaks=use_breaks, labels=use_labels, trans="reverse") + 
+            scale_y_continuous(name=pos_xlab, breaks=use_breaks, labels=use_labels, trans="reverse") +
+            annotate("path", 
+                      x=c(ymin_zoom, ymin_zoom, ymax_zoom), 
+                      y=c(ymin_zoom, ymax_zoom, ymax_zoom), 
+                      color="black", linewidth=0.8) + 
+            theme_pubr()
+    }
+    
+    p_ld[[ifelse(zoomed, "zoom", "full")]] <- p
+}
+```
+
+
+Plot with inset
+
+```{r subplotLD, fig.width=6, fig.height=6.5}
+# subvp <- viewport(width=0.35*1.2, height=0.31*1.2, x=0.35, y=0.65)
+# print(p_ld[["full"]])
+# print(p_ld[["zoom"]], vp=subvp)
+
+print(  p_ld[["full"]] + theme(legend.position = c(0.4, 0.95), legend.direction = "horizontal") + 
+        inset_element(p_ld[["zoom"]], left=0.025, bottom=0.45, right=0.45, top=0.875) )
+```
+
+## EHH subplots
+
+EHH traces of derived vs ancestral allele at putative SNP pos
+```{r subplotEHHsymp_allo, fig.width=4, fig.height=3}
+use_col <- c()
+use_col["Ancestral"] <- allosymp_color["Allopatry"]
+use_col["Derived"]   <- allosymp_color["Sympatry"]
+
+use_reg <- c("symp_allo", "North_admix", "South_admix")
+
+use_xlim <- range(unlist(lapply(ehh_sub[use_reg], function(x) range(x$ehh$POSITION))))
+use_xlim <- ScaleCoordinate(use_xlim, u=plt_x_units, from_snp=plt_x_from_snp)
+if(plt_x_from_snp){
+    use_breaks <- seq(0.5, -0.25, by=-0.25)
+} else {
+    use_breaks <- seq(ceiling(use_xlim[1] * 1e4), floor(use_xlim[2] * 1e4), length.out=4) / 1e4
+}
+
+plt_d <- list()
+for(reg in use_reg){
+    reg_nm <- ifelse(reg == "symp_allo", 
+                    "Sympatry + Allopatry", 
+                    str_replace(reg, "_admix", " admixed"))
+    plt_d[[reg]] <- melt(as.data.table(ehh_sub[[reg]][["ehh"]]), 
+                id.vars=c("POSITION", "NHAPLO_A", "NHAPLO_D"), measure.vars=c("EHH_A", "EHH_D"), 
+                variable.name="VARIABLE", value.name="VALUE")
+    plt_d[[reg]][, REGION := reg_nm]
+}
+
+plt_d <- rbindlist(plt_d)
+
+plt_d[, POSITION := ScaleCoordinate(POSITION, u=plt_x_units, from_snp=plt_x_from_snp)]
+plt_d[VARIABLE == "EHH_A", Allele := "Ancestral"]
+plt_d[VARIABLE == "EHH_D", Allele := "Derived"]
+
+
+p <- ggplot(plt_d, aes(x=POSITION, y=VALUE, color=Allele)) + 
+    geom_line(size=1) +
+    scale_color_manual(values=use_col) +
+    xlab(pos_xlab)
+if(plt_x_from_snp){
+    p <- p + scale_x_continuous(breaks=use_breaks)
+} else {
+    p <- p + scale_x_reverse(breaks=use_breaks)
+}
+p <- p +
+    coord_cartesian(xlim=rev(use_xlim)) +
+    ylab("EHH") +
+    facet_wrap(vars(REGION), nrow=1) +
+    theme_pubr(x.text.angle=30) +
+    theme(axis.text.x=element_text(size=8),
+          strip.text.x=element_text(size=8))
+p <- AnnotateGene(p, y=-0.05, w=2.5, u=plt_x_units, from_snp=plt_x_from_snp, exon_col=exon_col)
+
+p_ehh <- p
+print(p_ehh)
+```
+
+## XP-EHH subplot
+
+```{r subplotXPEHH, fig.width=12, fig.height=4}
+xpehh_sym_allo[, COORDINATE := ScaleCoordinate(POSITION, u=plt_x_units, from_snp=plt_x_from_snp)]
+p <- ggplot(xpehh_sym_allo, aes(x=COORDINATE, y=XPEHH_SYMP_ALLO)) +
+    geom_point(size=0.5, alpha=0.5) +
+    xlab(pos_xlab)
+
+if(plt_x_from_snp){
+    p <- p + xlim(rev(plt_xlim))
+} else {
+    p <- p + scale_x_reverse(limits=rev(plt_xlim))
+}
+
+p <- p + scale_y_continuous(name="XP-EHH\n(Sympatric vs. Allopatric)", breaks=seq(-4, 4, by=2)) +
+    theme_pubr()
+
+p <- AnnotateStdDev(p)
+p <- AnnotateGene(p, y=-3, u=plt_x_units, from_snp=plt_x_from_snp, exon_col=exon_col)
+print(p)
+
+p_xpehh <- p
+```
+
+
+# Final plotting
+
+```{r fullPlot, fig.width=12, fig.height=9}
+des <- "
+AAAADDDDDDD
+AAAAEEEEEEE
+BBBBFFFFFFF
+CCCCGGGGGGG
+"
+
+pA <- p_ld[["full"]] + #ggtitle("A") +
+    theme(legend.position = c(0.4, 0.95), legend.direction = "horizontal", 
+        text=element_text(family="Helvetica"), axis.text=element_text(size=9))
+pB <- p_xpehh + #ggtitle("B") +
+    theme(text=element_text(family="Helvetica"), 
+        axis.text=element_text(size=9), axis.title.y=element_text(size=10.5))
+
+pC <- p_ehh + #ggtitle("C") +
+    theme(legend.box.spacing=unit(0, "pt"), text=element_text(family="Helvetica"), 
+        axis.text=element_text(size=9))
+
+pD <- p_pi + #ggtitle("D") +
+    theme(legend.position = c(0.5, 0.95), legend.direction = "horizontal", 
+        text=element_text(family="Helvetica"), axis.text=element_text(size=9))
+pE <- p_sfs[["Taj"]] + #ggtitle("E") +
+    theme(legend.position="none",  
+        text=element_text(family="Helvetica"), axis.text=element_text(size=9))
+pF <- p_sfs[["Fay"]] + #ggtitle("F") +
+    theme(legend.position="none",  
+        text=element_text(family="Helvetica"), axis.text=element_text(size=9))
+pG <- p_fst + #ggtitle("G") +
+    theme(legend.box.spacing=unit(0, "pt"), 
+        text=element_text(family="Helvetica"), axis.text=element_text(size=9))
+# + theme(legend.position = c(0.5, 1.37), legend.direction = "horizontal", 
+#                     legend.background=element_blank(), legend.box.background=element_blank())
+
+p_full <- pA + inset_element(p_ld[["zoom"]], left=0.025, bottom=0.45, right=0.45, top=0.875) + 
+    pB + pC + pD + pE + pF + pG +
+    plot_layout(design=des)
+print(p_full)
+ggsave(p_full, filename="figure4.pdf", height=9, width=12)
+```

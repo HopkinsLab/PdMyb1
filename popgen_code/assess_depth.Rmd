@@ -1,0 +1,180 @@
+---
+title: "Assess Depth"
+output: html_document
+---
+
+Purpose: to assess the coverage depth at our PdMyb1 locus and find a window 
+within which we can trust SNP calls and perform population genetic analyses.
+
+# Load packages
+```{r loadPkg, message=FALSE}
+# Install packages
+req_pkgs <- c("data.table", "stringr", "ggpubr", "patchwork")
+for(pkg in req_pkgs){
+    if(!require(pkg, character.only=TRUE)){install.packages(pkg, repos="https://cloud.r-project.org/"); library(pkg, character.only=TRUE)}
+}
+```
+
+# Load data
+## Gene annotation data
+```{r loadAnnot}
+gene_d <- fread("annot/PdMyb1.gene.bed", header=FALSE, col.names=c("CHROM", "START", "END", "ELEMENT"), sep="\t")
+print(gene_d)
+```
+
+## VCF data
+
+First we use bcftools query to grab the mpileup depth values
+
+```{bash runQuery}
+# bash chunk
+
+for sp in drum cusp; do
+    merge_vcf=results/bcf_pipe/call/merged.${sp}.vcf.gz
+    qry_fn=${merge_vcf%.vcf*}.DP.qry
+    if [ ! -s $qry_fn ]; then
+        bcftools query -Hf '%CHROM\t%POS[\t%DP]\n' $merge_vcf > $qry_fn
+    fi
+done
+```
+
+Now we load in that data
+```{r loadQuery}
+depth_d <- list()
+for(sp in c("drum", "cusp")){
+    tmp <- fread(str_interp("results/bcf_pipe/call/merged.${sp}.DP.qry"), header=TRUE, sep="\t", 
+                    integer64="numeric", na.strings=".")
+    names(tmp)[1] <- str_remove(names(tmp)[1], "^#\\[1\\]")
+    names(tmp) <- str_remove(names(tmp), "^\\[[0-9]+\\]")
+    names(tmp) <- str_remove(names(tmp), ":DP$")
+    depth_d[[sp]] <- tmp
+    rm(tmp); gc()
+}
+```
+
+## Sample names
+```{r loadSamp}
+all_samps <- list()
+for(sp in names(depth_d)){
+    all_samps[[sp]] <- fread(str_interp("config/${sp}.samples.list"), header=FALSE, sep="\t")$V1
+    if(!all(all_samps[[sp]] %in% names(depth_d[[sp]]))){
+        stop("Not all samples represented in depth data")
+    }
+}
+```
+
+# Aggregate depth
+Aggregate depth by taking mean depth in 1 kb windows.
+
+NB: We assume that sites with NA depth have 0 coverage
+
+First bin/assign positions into windows
+
+```{r binPos}
+wsize <- 1000
+
+pos_range <- depth_d[["drum"]][, range(POS)]
+pos_range[1] <- floor(pos_range[1] / wsize ) * wsize
+pos_range[2] <- ceiling(pos_range[2] / wsize ) * wsize
+
+
+# Bin positions every 100 0
+aggr_breaks <- seq(pos_range[1], pos_range[2], by=wsize)
+for(sp in names(depth_d)){
+    depth_d[[sp]][, POS_BIN := cut(POS, aggr_breaks, labels=aggr_breaks[-length(aggr_breaks)])]
+    depth_d[[sp]][, POS_BIN := as.numeric(as.character(POS_BIN))]
+}
+```
+
+Next do the actual averaging.
+
+```{r aggrDepth}
+aggr_d <- list()
+for(sp in names(depth_d)){
+    for(samp in all_samps[[sp]]){
+        depth_d[[sp]][is.na(get(samp)), eval(samp) := 0]
+        aggr_d[[samp]] <- depth_d[[sp]][, .(MEAN_DP = mean(get(samp))), by=POS_BIN]
+        aggr_d[[samp]][, SAMPLE := samp]
+        aggr_d[[samp]][, SPECIES := sp]
+    }
+}
+aggr_d <- rbindlist(aggr_d)
+print(head(aggr_d))
+```
+
+# Plot!
+
+Plot the depth dropoff around the gene
+
+```{r plotDepth, fig.width=8, fig.height=4}
+AnnotateExons <- function(p, y=-10, lw=3){
+    use_color <- "#666666"
+
+    exonrange <- gene_d[str_starts(ELEMENT, "exon"), range(c(START, END))/1e3]
+    p <- p + annotate(geom="segment", x=exonrange[1], xend=exonrange[2], 
+                    y=y, yend=y, color=use_color, size=lw/7)
+
+    for(i in 1:nrow(gene_d)){
+        if(str_starts(gene_d[i, ELEMENT], "exon")){
+            p <- p + annotate(geom="segment", x=gene_d[i, START/1e3], xend=gene_d[i, END/1e3], 
+                            y=y, yend=y, color=use_color, size=lw)
+        }
+    }
+    return(p)
+}
+
+
+use_xlim <- c(-50, 50) + median(range(gene_d[, c(START, END)]))/1e3
+
+# Median and interquartile range across samples
+med_dp <- aggr_d[, as.list(quantile(MEAN_DP, probs=c(0.25, 0.5, 0.75))), by=.(POS_BIN)]
+setnames(med_dp, c("25%", "50%", "75%"), c("LWR", "MED", "UPR"))
+
+
+p_base <- ggplot() +
+    geom_line(aes(x=POS_BIN/1e3, y=MEAN_DP, group=SAMPLE), aggr_d[SPECIES=="drum"], alpha=0.1, color="black") +
+    geom_line(aes(x=POS_BIN/1e3, y=MEAN_DP, group=SAMPLE), aggr_d[SPECIES=="cusp"], color="coral", alpha=0.8) +
+    geom_ribbon(aes(x=POS_BIN/1e3, ymin=LWR, ymax=UPR), med_dp, color=NA, fill="dodgerblue", alpha=0.25) +
+    geom_line(aes(x=POS_BIN/1e3, y=MED), med_dp, color="dodgerblue4", alpha=1.0, size=0.3)
+
+
+p_base <- p_base + xlab("Position (kb)") + ylab("Mean depth (1 kb bins)") +
+    theme_pubr() + scale_x_reverse()
+
+p_depth <- AnnotateExons(p_base, y=-10, lw=2.5) + coord_cartesian(xlim=rev(use_xlim), ylim=c(0,500))
+
+print(p_depth)
+```
+
+Based on observing the general pattern across samples (and messing around with with plotly, not shown), settling on 
+the window: 
+
+`chrlg6A 22289000 22324000`
+
+```{r plotWithWindow, fig.width=12, fig.height=8}
+wstart <- 22289000L
+wend   <- 22324000L
+
+p_base <- p_base + 
+    geom_vline(xintercept=wstart/1e3, linetype="dotted") +
+    geom_vline(xintercept=wend/1e3,   linetype="dotted")
+
+p_A <- AnnotateExons(p_base, y=-20, lw=3) + coord_cartesian(xlim=rev(use_xlim))                + ggtitle("A") + theme(plot.title=element_text(size=18))
+p_B <- AnnotateExons(p_base, y=-10, lw=3) + coord_cartesian(xlim=rev(use_xlim), ylim=c(0,500)) + ggtitle("B") + theme(plot.title=element_text(size=18))
+
+p_out  <- p_A / p_B + plot_layout(heights=c(1, 1))
+
+ggsave(p_out, file="figureS6.pdf", width=12, height=8)
+
+print(p_out)
+```
+
+Save the final window as a bed file
+```{r saveBed}
+out_d <- data.table(CHROM="chrlg6A", START=wstart, END=wend)
+
+out_fn <- "results/bcf_pipe/call/drum.hi_dep_region.bed"
+
+fwrite(out_d, file=out_fn, sep="\t", row.names=FALSE, col.names=FALSE, quote=FALSE)
+```
+
