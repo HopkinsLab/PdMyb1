@@ -17,18 +17,16 @@ i=${SLURM_ARRAY_TASK_ID:-1}
 
 samp=$( cat $DRUM_LIST $CUSP_LIST | awk -v i=$i 'NR == i' )
 
-in_fn=seq/fastas/${samp}.fasta.gz
+# Gzipped fasta from running seqproc_code/ pipeline
+in_fn=../seqproc_code/results/sacra/${samp}/Samplix.${samp}.correctedReads.merged.fasta.gz
+
+
 bam_sort=seq/bams/${samp}.sorted.bam
 bam_prim=${bam_sort%.*}.primary.bam
 
 tmpscript=$TMPDIR/align.$i.$RANDOM.sh
 echo "Running $tmpscript"
 
-# echo "zcat $in_fn | $MINIMAP_CMD -z 600,200 -a -t 8 -x map-ont ${REF_FASTA}.mmi /dev/stdin | "'\' > $tmpscript
-# echo "    samtools addreplacerg -r ID:$samp -r SM:$samp /dev/stdin | "'\' >> $tmpscript
-# echo "    samtools sort -O BAM -T $TMPDIR -@ 4 /dev/stdin > $bam_sort" >> $tmpscript
-
-# srun -c $SLURM_CPUS_PER_TASK bash $tmpscript
 zcat $in_fn | $MINIMAP_CMD -I 30G -K 1G -z 600,200 -a -t 8 -x map-ont ${REF_FASTA} /dev/stdin | \
     samtools addreplacerg -r "ID:$samp" -r "SM:$samp" /dev/stdin | \
     samtools sort -O BAM -T $TMPDIR -@ 4 /dev/stdin > $bam_sort

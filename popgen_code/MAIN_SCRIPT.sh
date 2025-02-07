@@ -19,12 +19,9 @@ done
 
 # !!! Manual step: confirm/update paths in `utils/init_envs.sh`
 
-### DOWNLOAD REF, SEQUENCE FASTAS ###
+### DOWNLOAD REF ###
 
 #!!! TBD depending on where sequences are being hosted !!!
-# Will go in seq/fastas
-
-
 
 ### ALIGNMENT ###
 
