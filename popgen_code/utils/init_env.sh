@@ -33,5 +33,6 @@ MINIMAP_CMD="minimap2"
 PLINK_CMD="/n/holylfs05/LABS/hopkins_lab/Lab/software/plink_linux/plink"
 # ^^^^^^^^^^^^^^^^^^^^^^^^^^^
 # Edit to your own plink path
+# Minimap2 should be part of myb conda environment
 
 
