@@ -2,9 +2,6 @@
 
 ### SETUP ###
 
-# !!! Manual step: confirm/update paths in `utils/init_envs.sh`
-
-
 # Make directories
 dirlist=( logs ref results )
 for newdir in ${dirlist[@]}; do
@@ -12,6 +9,15 @@ for newdir in ${dirlist[@]}; do
         mkdir -p $newdir
     fi
 done
+
+for sp in drum cusp; do
+    fn=config/$sp.samples.list
+    if [ ! -s $fn ]; then
+        awk -v sp=$sp '$2 == sp {print $1}' ../all.samples.popmap.tsv > $fn
+    fi
+done
+
+# !!! Manual step: confirm/update paths in `utils/init_envs.sh`
 
 ### DOWNLOAD REF, SEQUENCE FASTAS ###
 
