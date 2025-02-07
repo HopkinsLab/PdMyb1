@@ -1,5 +1,7 @@
 bak/
 test/
 tmp/
+logs/
 *.old
 *.bak
+*.tar.gz
